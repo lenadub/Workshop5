@@ -3,7 +3,7 @@ import express from "express";
 import { BASE_NODE_PORT } from "../config";
 import { NodeState, Value } from "../types";
 
-type MsgType = "PROPOSAL" | "CONFIRM";
+type MsgType = "R" | "P";
 
 interface MsgPayload {
   type: MsgType;
@@ -13,13 +13,13 @@ interface MsgPayload {
 }
 
 export async function node(
-  id: number,
-  totalNodes: number,
-  maxFaulty: number,
-  startVal: Value,
-  isCorrupt: boolean,
-  isNetworkReady: () => boolean,
-  markNodeReady: (index: number) => void
+  nodeId: number,
+  N: number,
+  F: number,
+  initialValue: Value,
+  isFaulty: boolean,
+  nodesAreReady: () => boolean,
+  setNodeIsReady: (index: number) => void
 ) {
   const app = express();
   app.use(express.json());
@@ -27,38 +27,36 @@ export async function node(
 
   let state: NodeState = {
     killed: false,
-    x: isCorrupt ? null : startVal,
-    decided: isCorrupt ? null : false,
-    k: isCorrupt ? null : 1,
+    x: isFaulty ? null : initialValue,
+    decided: isFaulty ? null : false,
+    k: isFaulty ? null : 1,
   };
 
   let inbox: {
-    PROPOSAL: { [round: number]: { [value: string]: number } };
-    CONFIRM: { [round: number]: { [value: string]: number } };
+    R: { [round: number]: { [value: string]: number } };
+    P: { [round: number]: { [value: string]: number } };
   } = {
-    PROPOSAL: {},
-    CONFIRM: {},
+    R: {},
+    P: {},
   };
 
   let consensusRunning = false;
-  const toleranceThreshold = Math.floor((totalNodes - 1) / 3);
-  const exceedingFaultLimit = maxFaulty > toleranceThreshold;
+  const toleranceThreshold = Math.floor((N - 1) / 2);
+  const exceedingFaultLimit = F > toleranceThreshold;
 
-  // 📌 Reset round-based message storage
   function prepareInbox(round: number) {
-    if (!inbox.PROPOSAL[round]) inbox.PROPOSAL[round] = { "0": 0, "1": 0, "?": 0 };
-    if (!inbox.CONFIRM[round]) inbox.CONFIRM[round] = { "0": 0, "1": 0, "?": 0 };
+    if (!inbox.R[round]) inbox.R[round] = { "0": 0, "1": 0, "?": 0 };
+    if (!inbox.P[round]) inbox.P[round] = { "0": 0, "1": 0, "?": 0 };
   }
 
-  // 📬 Broadcast messages to all nodes
   async function sendToAll(msg: MsgPayload) {
-    if (state.killed || isCorrupt) return;
-    while (!isNetworkReady()) {
+    if (state.killed || isFaulty) return;
+    while (!nodesAreReady()) {
       await new Promise((resolve) => setTimeout(resolve, 100));
       if (state.killed) return;
     }
-    for (let i = 0; i < totalNodes; i++) {
-      if (i !== id && !state.killed) {
+    for (let i = 0; i < N; i++) {
+      if (i !== nodeId && !state.killed) {
         try {
           await fetch(`http://localhost:${BASE_NODE_PORT + i}/message`, {
             method: "POST",
@@ -70,72 +68,57 @@ export async function node(
     }
   }
 
-  // 🔄 The Ben-Or consensus process
   async function consensusLoop() {
-    if (state.killed || isCorrupt || !consensusRunning) return;
+    if (state.killed || isFaulty || !consensusRunning) return;
     if (state.decided && !exceedingFaultLimit) return;
   
     const round = state.k!;
     prepareInbox(round);
   
-    if (state.x !== null) inbox.PROPOSAL[round][state.x.toString()]++;
+    if (state.x !== null) inbox.R[round][state.x.toString()]++;
   
-    console.log(`🌀 Node ${id} - Round ${round} - Proposed Value: ${state.x}`);
-  
-    // 🏁 Phase 1: Send proposals
-    await sendToAll({ type: "PROPOSAL", round, val: state.x as Value, sender: id });
-    await waitForMessages(round, "PROPOSAL", totalNodes - maxFaulty);
+    await sendToAll({ type: "R", round, val: state.x as Value, sender: nodeId });
+    await waitForMessages(round, "R", N - F);
     if (state.killed || !consensusRunning) return;
   
-    console.log(`📩 Node ${id} - Round ${round} - Proposal Messages:`, inbox.PROPOSAL[round]);
-  
-    // 📌 Phase 2: Confirm values
     let confirmVal: Value = "?";
-    if (inbox.PROPOSAL[round]["0"] > Math.floor(totalNodes / 2)) confirmVal = 0;
-    else if (inbox.PROPOSAL[round]["1"] > Math.floor(totalNodes / 2)) confirmVal = 1;
+    if (inbox.R[round]["0"] > Math.floor(N / 2)) confirmVal = 0;
+    else if (inbox.R[round]["1"] > Math.floor(N / 2)) confirmVal = 1;
   
-    inbox.CONFIRM[round][confirmVal.toString()]++;
-    await sendToAll({ type: "CONFIRM", round, val: confirmVal, sender: id });
-    await waitForMessages(round, "CONFIRM", totalNodes - maxFaulty);
+    inbox.P[round][confirmVal.toString()]++;
+    await sendToAll({ type: "P", round, val: confirmVal, sender: nodeId });
+    await waitForMessages(round, "P", N - F);
     if (state.killed || !consensusRunning) return;
   
-    console.log(`✅ Node ${id} - Round ${round} - Confirm Messages:`, inbox.CONFIRM[round]);
-  
-    // 🏆 **Ensure nodes finalize after round 2**
     if (round >= 2) {
       let finalValue: Value = "?";
-      if (inbox.CONFIRM[round]["0"] > inbox.CONFIRM[round]["1"]) {
+      if (inbox.P[round]["0"] > inbox.P[round]["1"]) {
         finalValue = 0;
-      } else if (inbox.CONFIRM[round]["1"] > inbox.CONFIRM[round]["0"]) {
+      } else if (inbox.P[round]["1"] > inbox.P[round]["0"]) {
         finalValue = 1;
       }
   
       if (finalValue !== "?") {
         state.x = finalValue;
         state.decided = true;
-        console.log(`🎯 Node ${id} - FINAL DECISION: ${finalValue} at Round ${round}`);
         return;
       } else {
-        console.log(`⚠️ Node ${id} - Round ${round} - No clear majority, continuing...`);
         state.x = (round % 2) as Value;
       }
     }
   
     if (!state.decided) {
       state.k = round + 1;
-      console.log(`⏩ Node ${id} - Moving to Round ${state.k}`);
       setTimeout(consensusLoop, 50);
     }
   }
   
-
-  // 🎯 API Routes
   app.get("/status", (req, res) => {
-    res.status(isCorrupt ? 500 : 200).send(isCorrupt ? "faulty" : "live");
+    res.status(isFaulty ? 500 : 200).send(isFaulty ? "faulty" : "live");
   });
 
   app.post("/message", (req, res) => {
-    if (state.killed || isCorrupt) return res.status(200).send();
+    if (state.killed || isFaulty) return res.status(200).send();
     const msg: MsgPayload = req.body;
     if (!msg || !msg.type || msg.round === undefined || msg.val === undefined) {
       return res.status(400).send("Invalid message format");
@@ -146,7 +129,7 @@ export async function node(
   });
 
   app.get("/start", (req, res) => {
-    if (isCorrupt || state.killed) return res.status(500).send("Node is faulty or killed");
+    if (isFaulty || state.killed) return res.status(500).send("Node is faulty or killed");
     consensusRunning = true;
     if (!state.decided) setTimeout(consensusLoop, 50);
     return res.status(200).send("Consensus started");
@@ -159,7 +142,7 @@ export async function node(
   });
 
   app.get("/getState", (req, res) => {
-    if (isCorrupt) {
+    if (isFaulty) {
       return res.status(200).json({
         killed: state.killed,
         x: null,
@@ -188,9 +171,9 @@ export async function node(
     }
   }
 
-  const server = app.listen(BASE_NODE_PORT + id, () => {
-    console.log(`Node ${id} is active on port ${BASE_NODE_PORT + id}`);
-    markNodeReady(id);
+  const server = app.listen(BASE_NODE_PORT + nodeId, () => {
+    console.log(`Node ${nodeId} listening on port ${BASE_NODE_PORT + nodeId}`);
+    setNodeIsReady(nodeId);
   });
 
   return server;
